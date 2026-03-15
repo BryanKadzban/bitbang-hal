@@ -5,7 +5,9 @@
   - A periodic timer to mark clock cycles
   - Two GPIO pins for SDA and SCL lines.
 
-  Note that the current implementation does not support I2C clock stretching.
+  Clock stretching is supported in the i2c initiator only.
+
+  At startup, as an initiator, the bus can be cleared using the recover() method.
 
   ## Hardware requirements
 
@@ -62,6 +64,10 @@ pub enum Error<E> {
     Bus(E),
     /// No ack received
     NoAck,
+    /// Clock stretched too long
+    ClockStretchTimeout,
+    /// Bus was stuck with sda low: possibly sda shorted to ground
+    BusResetFailed,
     /// Invalid input
     InvalidData,
 }
@@ -76,17 +82,41 @@ where
     scl: SCL,
     sda: SDA,
     clk: CLK,
+    clock_stretch_iterations: u32,
 }
 
 impl<SCL, SDA, CLK, E> I2cBB<SCL, SDA, CLK>
 where
-    SCL: OutputPin<Error = E>,
+    SCL: OutputPin<Error = E> + InputPin<Error = E>,
     SDA: OutputPin<Error = E> + InputPin<Error = E>,
     CLK: CountDown + Periodic,
 {
     /// Create instance
-    pub fn new(scl: SCL, sda: SDA, clk: CLK) -> Self {
-        I2cBB { scl, sda, clk }
+    pub fn new(scl: SCL, sda: SDA, clk: CLK, clock_stretch_iterations: u32) -> Self {
+        I2cBB { scl, sda, clk, clock_stretch_iterations }
+    }
+
+    /// Clear the bus: get any stuck target device to listen for a start
+    /// condition again, by clocking out stop conditions until one takes effect
+    /// on the real pins.
+    pub fn recover(&mut self) -> Result<(), crate::i2c::Error<E>> {
+        let mut stop_attempts = 0;
+
+        while {
+            self.set_scl_low()?;
+            self.set_sda_low()?;
+            self.wait_for_clk();
+            self.set_scl_high()?;
+            self.set_sda_high()?;
+            self.wait_for_clk();
+            self.sda.is_high().map_err(Error::Bus)?
+        } {
+            stop_attempts += 1;
+            if stop_attempts > 18 {
+                return Err(Error::BusResetFailed);
+            }
+        }
+        Ok(())
     }
 
     /// Send a raw I2C start.
@@ -222,6 +252,22 @@ where
     #[inline]
     fn set_scl_high(&mut self) -> Result<(), crate::i2c::Error<E>> {
         self.scl.set_high().map_err(Error::Bus)
+            .and_then(|_| {
+                let mut iterations = self.clock_stretch_iterations;
+                while !self.scl.is_high().map_err(Error::Bus)? && iterations > 0 {
+                    iterations -= 1;
+                }
+                if iterations == 0 {
+                    Err(Error::ClockStretchTimeout)
+                } else {
+                    // Poll the periodic timer to ensure we didn't outlast the
+                    // full half-clock-cycle delay while waiting for scl.  If we
+                    // did, we need to check it once to clear the rollover bit
+                    // so the next wait_for_clk() correctly delays.
+                    self.clk.wait().ok();
+                    Ok(())
+                }
+            })
     }
 
     #[inline]
@@ -256,7 +302,7 @@ where
 
 impl<SCL, SDA, CLK, E> Write for I2cBB<SCL, SDA, CLK>
 where
-    SCL: OutputPin<Error = E>,
+    SCL: OutputPin<Error = E> + InputPin<Error = E>,
     SDA: OutputPin<Error = E> + InputPin<Error = E>,
     CLK: CountDown + Periodic,
 {
@@ -279,7 +325,7 @@ where
 
 impl<SCL, SDA, CLK, E> Read for I2cBB<SCL, SDA, CLK>
 where
-    SCL: OutputPin<Error = E>,
+    SCL: OutputPin<Error = E> + InputPin<Error = E>,
     SDA: OutputPin<Error = E> + InputPin<Error = E>,
     CLK: CountDown + Periodic,
 {
@@ -306,7 +352,7 @@ where
 
 impl<SCL, SDA, CLK, E> WriteRead for I2cBB<SCL, SDA, CLK>
 where
-    SCL: OutputPin<Error = E>,
+    SCL: OutputPin<Error = E> + InputPin<Error = E>,
     SDA: OutputPin<Error = E> + InputPin<Error = E>,
     CLK: CountDown + Periodic,
 {
