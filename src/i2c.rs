@@ -96,6 +96,11 @@ where
         I2cBB { scl, sda, clk, clock_stretch_iterations }
     }
 
+    /// Destroy an instance
+    pub fn free(self) -> (SCL, SDA, CLK) {
+        (self.scl, self.sda, self.clk)
+    }
+
     /// Clear the bus: get any stuck target device to listen for a start
     /// condition again, by clocking out stop conditions until one takes effect
     /// on the real pins.
